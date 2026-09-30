@@ -1,0 +1,4 @@
+# Never let git convert line endings in the asset pieces (would corrupt the ROM data on Windows checkouts)
+*.bin binary
+# Keep shell scripts LF so they run in the devkitPro container
+*.sh text eol=lf

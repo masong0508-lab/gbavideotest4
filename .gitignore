@@ -1,0 +1,24 @@
+# build output
+build/
+*.elf
+*.gba
+*.o
+
+# encoder scratch / compiled helper tools
+work/
+tools/adpcm_enc
+tools/recompress/lrle
+tools/recompress/dec
+tools/recompress/out/
+tools/recompress/*.raw
+tools/recompress/*.adpcm
+tools/recompress/*.state
+tools/recompress/pal.rgb
+tools/recompress/o.bin
+tools/recompress/s.txt
+
+# python / OS noise
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
