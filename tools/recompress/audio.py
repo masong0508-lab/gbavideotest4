@@ -23,7 +23,8 @@ print('chunks',n//304)
 for c,nm in ((0,'L'),(1,'R')):
     subprocess.run(['./adpcm_enc',f'{nm}.adpcm',f'{nm}.state'],stdin=open(f'{nm}.raw','rb'),check=True)
 L=np.fromfile('L.adpcm',np.uint8).reshape(-1,152);R=np.fromfile('R.adpcm',np.uint8).reshape(-1,152)
-open('audio.bin','wb').write(np.concatenate([L,R],1).tobytes())
+au=np.concatenate([L,R],1).tobytes(); ac=(len(au)//304)//2*304
+open('audio_a.bin','wb').write(au[:ac]); open('audio_b.bin','wb').write(au[ac:])
 st=np.stack([np.fromfile('L.state','<u4'),np.fromfile('R.state','<u4')],1)
 open('audio_state.bin','wb').write(st.astype('<u4').tobytes())
-import os;print(os.path.getsize('audio.bin')/2**20,'MiB',os.path.getsize('audio_state.bin')/2**20)
+import os;print((os.path.getsize('audio_a.bin')+os.path.getsize('audio_b.bin'))/2**20,'MiB',os.path.getsize('audio_state.bin')/2**20)
