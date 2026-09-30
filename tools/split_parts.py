@@ -8,6 +8,7 @@ OUT/part01, OUT/part02, ... in exactly the layout main.c and the Makefile expect
 
     python3 tools/split_parts.py parts/film gen          # what the GitHub workflow runs
     python3 tools/split_parts.py parts/film parts        # local build: then just `make`
+    python3 tools/split_parts.py parts/film gen --clip clip   # also drops the Konami clip into part01 (room is reserved for it)
 
 Input pieces (either naming works): frames1a/1b/2.bin or frames1/2.bin, audio_a/b.bin or audio.bin,
 frames_idx.bin, palette.bin, audio_state.bin.   Every output part is checked against the input before exit.
@@ -36,7 +37,16 @@ def t_of(u):                   # vblank tick at which unique frame u starts (eac
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src"); ap.add_argument("out")
+    ap.add_argument("--clip", help="folder with clip_*.bin (see tools/clipenc.py); copied into part01 only")
     a = ap.parse_args()
+    clip_files = ["clip_frames.bin", "clip_idx.bin", "clip_palette.bin", "clip_audio.bin", "clip_state.bin"]
+    clip_bytes = 0
+    if a.clip:
+        for c in clip_files:
+            if not os.path.exists(os.path.join(a.clip, c)):
+                sys.exit("ERROR: %s/%s is missing (run tools/clipenc.py)" % (a.clip, c))
+        clip_bytes = sum(os.path.getsize(os.path.join(a.clip, c)) for c in clip_files) + 64
+        print("Konami clip: %.3f MiB reserved in part01" % (clip_bytes / 2**20))
 
     for r in REQUIRED:
         if not os.path.exists(os.path.join(a.src, r)):
@@ -78,13 +88,14 @@ def main():
         return (idx[u1] - idx[u0]) + 4 * (u1 - u0 + 1) + 36 * nseg(u0, u1) + (c1 - c0) * (CHUNK + 8)
 
     cap = ROM_LIMIT - CODE_ALLOW
+    cap_of = lambda i: cap - clip_bytes if i == 0 else cap        # part01 also carries the clip
     cuts = None
     for n in range(1, 40):
         cuts = [0]; ok = True
         for k in range(n - 1):
             u0 = cuts[-1]
             remaining = size(u0, nu, True)
-            share = min(cap, remaining / (n - k))
+            share = min(cap_of(k), remaining / (n - k))
             lo, hi = u0 + 1, nu - 1                         # largest u1 with size(u0,u1) <= share
             while lo < hi:
                 mid = (lo + hi + 1) // 2
@@ -94,7 +105,7 @@ def main():
                        key=lambda u: abs(t_of(u) / VB_PER_CHUNK - round(t_of(u) / VB_PER_CHUNK)))
             cuts.append(best)
         cuts.append(nu)
-        if all(size(cuts[i], cuts[i + 1], i == n - 1) <= cap for i in range(n)):
+        if all(size(cuts[i], cuts[i + 1], i == n - 1) <= cap_of(i) for i in range(n)):
             break
     else:
         sys.exit("could not fit the film in ROM-sized parts")
@@ -124,6 +135,8 @@ def main():
         half = ((c1 - c0) // 2) * CHUNK
         w("audio_a.bin", au[:half]); w("audio_b.bin", au[half:])
         w("audio_state.bin", struct.pack("<%dI" % len(stl), *stl))
+        if i == 0 and a.clip:
+            for c in clip_files: w(c, open(os.path.join(a.clip, c), "rb").read())
         total = sum(os.path.getsize(os.path.join(d, x)) for x in os.listdir(d))
         assert total + CODE_ALLOW <= ROM_LIMIT
         m = dict(part=i + 1, first_unique_frame=u0, unique_frames=u1 - u0, start_min=round(f0 / 5 / 60, 2),
