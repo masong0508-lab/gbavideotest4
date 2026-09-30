@@ -8,7 +8,7 @@ GBAFIX  := $(shell which gbafix 2>/dev/null || echo /opt/devkitpro/tools/bin/gba
 
 PARTDIR ?= parts
 PARTS   := $(sort $(notdir $(wildcard $(PARTDIR)/part[0-9]*)))
-ASSETS  := menu_bg.bin menu_pal.bin secret_bg.bin secret_pal.bin extra_frames.bin extra_idx.bin extra_palette.bin extra_audio.bin extra_state.bin
+ASSETS  := menu_bg.bin menu_bg6.bin menu_pal.bin secret_bg.bin secret_pal.bin extra_frames.bin extra_idx.bin extra_palette.bin extra_audio.bin extra_state.bin
 NEEDED  := frames1a.bin frames1b.bin frames2.bin frames_idx.bin palette.bin audio_a.bin audio_b.bin audio_state.bin
 CFLAGS  := -O2 -mthumb -mthumb-interwork -Wall
 
