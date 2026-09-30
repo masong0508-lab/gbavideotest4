@@ -1,7 +1,8 @@
-/* GBA video player - STEREO version.
+/* GBA video player - STEREO version with the title MENU.
+   Menu: PLAY / CHAPTERS / CONTROLS (+ two hidden button codes on the main menu).
    Plays ONE looping video part: 120x68 @ 5fps (2x scaled, Mode 4) + stereo 4-bit ADPCM audio
    (left -> FIFO A / DMA1, right -> FIFO B / DMA2, both clocked by Timer 0).
-   START = pause/resume, A+Right = fast-forward, A+Left = rewind.
+   In video: START (or A+Up) = pause/resume, A+Right = fast-forward, A+Left (or A+Down) = rewind, SELECT = back to menu.
    All video/audio data lives in the .bin files; see README.md and tools/gbatool.py. */
 #include "adpcm.h"
 
@@ -24,11 +25,16 @@
 #define REG_IF         REG16(0x04000202)
 #define REG_IME        REG16(0x04000208)
 #define REG_VCOUNT     REG16(0x04000006)
+#define REG_BLDCNT     REG16(0x04000050)
+#define REG_BLDALPHA   REG16(0x04000052)
 #define REG_KEYINPUT   REG16(0x04000130)
 #define IRQ_VECTOR     REG32(0x03007FFC)
 #define PALETTE     ((volatile u16*)0x05000000)
 #define VRAM_PAGE0  ((volatile u16*)0x06000000)
 #define VRAM_PAGE1  ((volatile u16*)0x0600A000)
+#define OAM         ((volatile u16*)0x07000000)
+#define OBJ_PAL     ((volatile u16*)0x05000200)
+#define OBJ_TILES   ((volatile u32*)0x06014000)
 
 #define VID_W 120
 #define VID_H 68
@@ -42,9 +48,10 @@
 #define VB_PER_CHUNK 4
 #define TIMER_PERIOD 3696
 #define CHUNK_BYTES SAMPLES_PER_CHUNK
-#define NCHUNKS ((u32)(audio_end - audio_start) / CHUNK_BYTES)
+#define FPS_NUM 5486u               /* video frame = (vblank_tick * 5486) >> 16  (~5 fps) */
 
-/* Everything is embedded in the ROM */
+/* Everything is embedded in the ROM.  The film comes from the part folder, the menu/secret/hidden-clip
+   files from the repo root (the Makefile passes the part folder to the assembler with -Wa,-I). */
 __asm__(
     ".section .rodata\n"
     ".balign 4\n"
@@ -70,6 +77,36 @@ __asm__(
     ".global audio_state\naudio_state:\n"
     ".incbin \"audio_state.bin\"\n"
     ".balign 4\n"
+    ".global menu_bg\nmenu_bg:\n"
+    ".incbin \"menu_bg.bin\"\n"
+    ".balign 4\n"
+    ".global menu_pal\nmenu_pal:\n"
+    ".incbin \"menu_pal.bin\"\n"
+    ".balign 4\n"
+    ".global secret_bg\nsecret_bg:\n"
+    ".incbin \"secret_bg.bin\"\n"
+    ".balign 4\n"
+    ".global secret_pal\nsecret_pal:\n"
+    ".incbin \"secret_pal.bin\"\n"
+    ".balign 4\n"
+    ".global x_frames_start\nx_frames_start:\n"        /* hidden clip: same formats as the film */
+    ".incbin \"extra_frames.bin\"\n"
+    ".balign 4\n"
+    ".global x_idx_start\nx_idx_start:\n"
+    ".incbin \"extra_idx.bin\"\n"
+    ".global x_idx_end\nx_idx_end:\n"
+    ".balign 4\n"
+    ".global x_pal_start\nx_pal_start:\n"
+    ".incbin \"extra_palette.bin\"\n"
+    ".global x_pal_end\nx_pal_end:\n"
+    ".balign 4\n"
+    ".global x_audio_start\nx_audio_start:\n"
+    ".incbin \"extra_audio.bin\"\n"
+    ".global x_audio_end\nx_audio_end:\n"
+    ".balign 4\n"
+    ".global x_state\nx_state:\n"
+    ".incbin \"extra_state.bin\"\n"
+    ".balign 4\n"
     ".text\n"
 );
 extern const u8  frames_start[], frames_end[];
@@ -80,6 +117,32 @@ typedef struct { u32 first; u16 col[16]; } PalSeg;
 extern const PalSeg palette_data[], palette_end[];
 extern const u8  audio_start[], audio_end[];
 extern const u32 audio_state[];   /* per chunk, [L,R]: low 16 bits = predictor (s16), bits 16-23 = step index */
+extern const u16 menu_bg[19200], menu_pal[256], secret_bg[19200], secret_pal[256];
+extern const u8  x_frames_start[];
+extern const u32 x_idx_start[], x_idx_end[];
+extern const PalSeg x_pal_start[], x_pal_end[];
+extern const u8  x_audio_start[], x_audio_end[];
+extern const u32 x_state[];
+
+/* One playable video: the film of this ROM part, or the hidden clip. */
+typedef struct {
+    const u8 *frames;
+    const u32 *idx;  u32 nuniq;        /* per unique frame: byte offset into frames (+1 final entry) */
+    const PalSeg *pal; u32 npal;
+    const u8 *audio; u32 nchunks;
+    const u32 *state;
+} Stream;
+static Stream film, extra;
+static void init_streams(void) {
+    film.frames = frames_start;  film.idx = frames_idx_start;  film.nuniq = (u32)(frames_idx_end - frames_idx_start) - 1;
+    film.pal = palette_data;     film.npal = (u32)(palette_end - palette_data);
+    film.audio = audio_start;    film.nchunks = (u32)(audio_end - audio_start) / CHUNK_BYTES;
+    film.state = audio_state;
+    extra.frames = x_frames_start; extra.idx = x_idx_start;   extra.nuniq = (u32)(x_idx_end - x_idx_start) - 1;
+    extra.pal = x_pal_start;       extra.npal = (u32)(x_pal_end - x_pal_start);
+    extra.audio = x_audio_start;   extra.nchunks = (u32)(x_audio_end - x_audio_start) / CHUNK_BYTES;
+    extra.state = x_state;
+}
 
 /* ---- audio state ---- */
 static s8 abuf[2][2][SAMPLES_PER_CHUNK] __attribute__((aligned(4)));   /* [buffer][channel][sample] */
@@ -161,8 +224,144 @@ static void draw_frame(const u8 *src, volatile u16 *dst) {
         }
     }
 }
-
 static void wait_vb(void) { while (REG_VCOUNT >= 160) {} while (REG_VCOUNT < 160) {} }
+
+/* ================= menu (from the template) ================= */
+static const char font_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ123";
+static const u8 font5x7[29][5] = {
+{0x7E,0x11,0x11,0x11,0x7E},{0x7F,0x49,0x49,0x49,0x36},{0x3E,0x41,0x41,0x41,0x22},
+{0x7F,0x41,0x41,0x41,0x3E},{0x7F,0x49,0x49,0x49,0x41},{0x7F,0x09,0x09,0x09,0x01},
+{0x3E,0x41,0x49,0x49,0x7A},{0x7F,0x08,0x08,0x08,0x7F},{0x00,0x41,0x7F,0x41,0x00},
+{0x20,0x40,0x41,0x3F,0x01},{0x7F,0x08,0x14,0x22,0x41},{0x7F,0x40,0x40,0x40,0x40},
+{0x7F,0x02,0x0C,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},{0x3E,0x41,0x41,0x41,0x3E},
+{0x7F,0x09,0x09,0x09,0x06},{0x3E,0x41,0x51,0x21,0x5E},{0x7F,0x09,0x19,0x29,0x46},
+{0x46,0x49,0x49,0x49,0x31},{0x01,0x01,0x7F,0x01,0x01},{0x3F,0x40,0x40,0x40,0x3F},
+{0x1F,0x20,0x40,0x20,0x1F},{0x3F,0x40,0x38,0x40,0x3F},{0x63,0x14,0x08,0x14,0x63},
+{0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43},
+{0x00,0x42,0x7F,0x40,0x00},{0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31}
+};
+
+static void put(int x, int y, u8 c) {
+    if ((unsigned)x >= 240 || (unsigned)y >= 160) return;
+    volatile u16 *p = VRAM_PAGE0 + ((y * 240 + x) >> 1);
+    u16 v = *p;
+    *p = (x & 1) ? (u16)((v & 0xFF) | (c << 8)) : (u16)((v & 0xFF00) | c);
+}
+
+static const u8 *glyph(char ch) {
+    for (int i = 0; font_chars[i]; i++) if (font_chars[i] == ch) return font5x7[i];
+    return 0;
+}
+
+static int text_w(const char *s) { int n = 0; while (*s++) n++; return n * 7 - 1; }
+
+/* bold 5x7 text: colour 255 (white) with colour 254 (black) shadow */
+static void text(int x, int y, const char *s) {
+    for (int pass = 0; pass < 2; pass++) {
+        int cx = x;
+        for (const char *p = s; *p; p++, cx += 7) {
+            const u8 *g = glyph(*p);
+            if (!g) continue;
+            for (int c = 0; c < 5; c++)
+                for (int r = 0; r < 7; r++)
+                    if ((g[c] >> r) & 1) {
+                        if (pass == 0) { put(cx + c + 1, y + r + 1, 254); put(cx + c + 2, y + r + 1, 254); }
+                        else           { put(cx + c, y + r, 255);         put(cx + c + 1, y + r, 255); }
+                    }
+        }
+    }
+}
+
+static void menu_setup(void) {
+    REG_IME = 0;
+    for (int i = 0; i < 256; i++) PALETTE[i] = menu_pal[i];
+    REG_DISPCNT = 4 | (1 << 10);
+    for (int i = 0; i < 19200; i++) VRAM_PAGE0[i] = menu_bg[i];
+    for (int i = 0; i < 128; i++) OAM[i * 4] = 0x200;      /* hide all sprites */
+}
+
+/* 64x32 rounded highlight sprite (4bpp), alpha-blended over the background */
+static void make_highlight(void) {
+    OBJ_PAL[1] = 8 | (31 << 5) | (4 << 10);     /* bright lime core */
+    OBJ_PAL[2] = 4 | (24 << 5) | (2 << 10);     /* darker rim */
+    for (int ty = 0; ty < 4; ty++)
+        for (int tx = 0; tx < 8; tx++)
+            for (int r = 0; r < 8; r++) {
+                u32 w = 0;
+                for (int k = 0; k < 8; k++) {
+                    int X = tx * 8 + k, Y = ty * 8 + r;
+                    int dx = X < 12 ? 12 - X : (X > 51 ? X - 51 : 0);
+                    int dy = Y < 12 ? 12 - Y : (Y > 19 ? Y - 19 : 0);
+                    int d = dx * dx + dy * dy;
+                    u32 px = d > 144 ? 0 : (d > 81 ? 2 : 1);
+                    w |= px << (4 * k);
+                }
+                OBJ_TILES[(ty * 8 + tx) * 8 + r] = w;
+            }
+    REG_BLDCNT = 0x0450;                        /* OBJ 1st target, alpha, BG2 2nd target */
+    REG_BLDALPHA = 5 | (11 << 8);
+}
+
+#define ROW_Y(i) (15 + 23 * (i))                /* text row centres from the layout guide */
+#define COL_CX 192
+
+/* Secret screen (Konami code on the main menu). Same format as the menu
+   background: 240x160 8-bit, palette idx 254 = black, 255 = white.
+   Shows the image until any button is pressed, then returns to the menu.
+   Put your own sound/animation here if you want one. */
+static void secret(void) {
+    REG_IME = 0;
+    for (int i = 0; i < 256; i++) PALETTE[i] = secret_pal[i];
+    REG_DISPCNT = 4 | (1 << 10);
+    for (int i = 0; i < 19200; i++) VRAM_PAGE0[i] = secret_bg[i];
+    for (int i = 0; i < 128; i++) OAM[i * 4] = 0x200;
+    text(120 - text_w("SECRET") / 2, 76, "SECRET");   /* remove this line for a text-free screen */
+
+    u16 prev = (u16)(~REG_KEYINPUT & 0x3FF);
+    for (;;) {
+        wait_vb();
+        u16 k = (u16)(~REG_KEYINPUT & 0x3FF);
+        u16 hit = k & ~prev;
+        prev = k;
+        if (hit) return;
+    }
+}
+
+/* returns chosen index, or -1 for B (only when allow_back) */
+static int menu(const char *const *items, int n, int allow_back) {
+    menu_setup();
+    for (int i = 0; i < n; i++) text(COL_CX - text_w(items[i]) / 2, ROW_Y(i) - 3, items[i]);
+    make_highlight();
+    REG_DISPCNT = 4 | (1 << 10) | (1 << 6) | (1 << 12);
+    int sel = 0;
+    static const u16 konami[10]  = { 0x40, 0x40, 0x80, 0x80, 0x20, 0x10, 0x20, 0x10, 0x02, 0x01 };
+    /* Altered code: D D U U L R L R B A, triggers the easter-egg clip */
+    static const u16 konami2[10] = { 0x80, 0x80, 0x40, 0x40, 0x20, 0x10, 0x20, 0x10, 0x02, 0x01 };
+    int ki = 0, ki2 = 0;
+    u16 prev = (u16)(~REG_KEYINPUT & 0x3FF);
+    for (;;) {
+        wait_vb();
+        OAM[0] = (u16)(((ROW_Y(sel) - 16) & 0xFF) | (1 << 10) | (1 << 14));
+        OAM[1] = (u16)(((COL_CX - 32) & 0x1FF) | (3 << 14));
+        OAM[2] = 512;
+        u16 k = (u16)(~REG_KEYINPUT & 0x3FF);
+        u16 hit = k & ~prev;
+        prev = k;
+        if (!allow_back && hit) {                            /* Konami: U U D D L R L R B A */
+            if (hit == konami[ki]) ki++;
+            else ki = (hit == konami[0]) ? 1 : 0;
+            if (ki == 10) { secret(); return -2; }
+
+            if (hit == konami2[ki2]) ki2++;
+            else ki2 = (hit == konami2[0]) ? 1 : 0;
+            if (ki2 == 10) { ki2 = 0; return -3; }
+        }
+        if (hit & 0x40) sel = (sel + n - 1) % n;             /* up */
+        if (hit & 0x80) sel = (sel + 1) % n;                 /* down */
+        if (hit & 0x09) return sel;                          /* A / START */
+        if ((hit & 0x02) && allow_back) return -1;           /* B */
+    }
+}
 
 /* ================= playback ================= */
 static void start_audio(u32 st, const u8 *audio_base, u32 nchunks, const u32 *states) {
@@ -200,26 +399,69 @@ static void stop_audio(void) {
     REG_IF = 0xFFFF;
 }
 
+
+/* ---- CONTROLS screen ---- */
+static void controls(void) {
+    menu_setup();
+    for (int y = 10; y < 150; y++) for (int x = 10; x < 230; x++) put(x, y, 254);
+    text(20, 16, "CONTROLS");
+    text(20, 34, "UP DOWN   MOVE");
+    text(20, 48, "A OR START   SELECT");
+    text(20, 62, "B   BACK");
+    text(20, 80, "IN VIDEO");
+    text(20, 94, "START OR A UP   PAUSE");
+    text(20, 108, "A RIGHT   FAST FORWARD");
+    text(20, 122, "A LEFT OR DOWN   REWIND");
+    text(20, 136, "SELECT   MENU");
+    u16 prev = (u16)(~REG_KEYINPUT & 0x3FF);
+    for (;;) {
+        wait_vb();
+        u16 k = (u16)(~REG_KEYINPUT & 0x3FF);
+        u16 hit = k & ~prev;
+        prev = k;
+        if (hit & 0x0B) return;
+    }
+}
+
 #define SEEK_STEP 4                         /* ticks (vblanks) per frame while seeking = 4x speed */
 
-int main(void) {
-    unsigned count = ((unsigned)(frames_idx_end - frames_idx_start) - 1) * 2;   /* idx has one entry per unique frame; each is shown for 2 steps */
-    const u32 nseg = (u32)(palette_end - palette_data);
-    const u32 fps_num = 5486u;
-    u32 maxpos = ((u32)count << 16) / fps_num;
-    if (maxpos > NCHUNKS * VB_PER_CHUNK - VB_PER_CHUNK) maxpos = NCHUNKS * VB_PER_CHUNK - VB_PER_CHUNK;
+#define NCHAPTERS 6
+/* Chapters: PART 1..6 = the start of each sixth of this ROM's video (audio chunk aligned). */
+static u32 chapter_tick(const Stream *S, int p) {
+    u32 count = S->nuniq * 2;
+    u32 f = count * (u32)p / NCHAPTERS;
+    u32 t = ((f << 16) + (FPS_NUM - 1)) / FPS_NUM;
+    t &= ~(u32)(VB_PER_CHUNK - 1);
+    if (t / VB_PER_CHUNK >= S->nchunks) t = 0;
+    return t;
+}
+
+/* Plays one Stream from tick `st` until SELECT is pressed (then returns to the menu). */
+static void play_stream(const Stream *S, u32 st) {
+    const u32 count = S->nuniq * 2;         /* idx has one entry per unique frame; each is shown for 2 steps */
+    u32 maxpos = (count << 16) / FPS_NUM;
+    if (maxpos > S->nchunks * VB_PER_CHUNK - VB_PER_CHUNK) maxpos = S->nchunks * VB_PER_CHUNK - VB_PER_CHUNK;
     maxpos &= ~(u32)(VB_PER_CHUNK - 1);
+    st &= ~(u32)(VB_PER_CHUNK - 1);
+    if (st > maxpos) st = 0;
 
+    REG_IME = 0;
+    REG_BLDCNT = 0;                                         /* the menu's highlight blend is off */
+    for (int i = 0; i < 128; i++) OAM[i * 4] = 0x200;       /* hide the menu's sprites */
     for (int i = 0; i < 256; i++) PALETTE[i] = 0;
+    for (int i = 0; i < 19200; i++) { VRAM_PAGE0[i] = 0; VRAM_PAGE1[i] = 0; }
+    REG_DISPCNT = 4 | (1 << 10);                            /* Mode 4, page 0 */
+
+    unsigned f0 = (st * FPS_NUM) >> 16;
+    if (f0 >= count) f0 = count - 1;
     u32 seg = 0;
-    for (int i = 0; i < 16; i++) PALETTE[i + 1] = palette_data[0].col[i];
-    u32 pend_seg = 0;
-    for (int i = 0; i < 19200; i++) VRAM_PAGE0[i] = 0;
-    REG_DISPCNT = 4 | (1 << 10);            /* Mode 4, page 0 */
+    while (seg + 1 < S->npal && S->pal[seg + 1].first <= f0) seg++;
+    for (int i = 0; i < 16; i++) PALETTE[i + 1] = S->pal[seg].col[i];
+    u32 pend_seg = seg;
 
-    start_audio(0, audio_start, NCHUNKS, audio_state);
+    start_audio(st, S->audio, S->nchunks, S->state);
 
-    u32 last = 0, pos = 0;
+    u32 last = st, pos = st;
     int mode = 0;                           /* 0 play, 1 pause, 2 fast-forward, 3 rewind */
     int paused = 0;
     int drawn = -1, pending = 0, page = 0;
@@ -242,17 +484,20 @@ int main(void) {
         u16 hit = k & ~prev;
         prev = k;
 
+        if (hit & 4) break;                 /* SELECT: back to the menu */
         if (hit & 8) paused ^= 1;           /* START: pause / resume */
         int a = k & 1;
+        if (a && (hit & 0x40)) paused ^= 1; /* A + Up: pause / resume */
+        else if ((hit & 1) && (k & 0x40)) paused ^= 1;
         int nm = paused ? 1 : 0;
-        if (a && (k & 0x10)) nm = 2;        /* A + Right: fast-forward */
-        else if (a && (k & 0x20)) nm = 3;   /* A + Left: rewind */
+        if (a && (k & 0x10)) nm = 2;                        /* A + Right: fast-forward */
+        else if (a && (k & 0xA0)) nm = 3;                   /* A + Left or A + Down: rewind */
 
         if (nm != mode) {
             if (mode == 0) { pos = t > maxpos ? maxpos : t; stop_audio(); }
             if (nm == 0) {                  /* resume: re-sync audio to the video position */
                 u32 s = pos & ~(u32)(VB_PER_CHUNK - 1);
-                start_audio(s, audio_start, NCHUNKS, audio_state);
+                start_audio(s, S->audio, S->nchunks, S->state);
                 last = s; t = s;
             }
             mode = nm;
@@ -262,20 +507,37 @@ int main(void) {
             page ^= 1;
             if (pend_seg != seg) {                 /* new scene: swap the 16 colours together with the page flip */
                 seg = pend_seg;
-                for (int i = 0; i < 16; i++) PALETTE[i + 1] = palette_data[seg].col[i];
+                for (int i = 0; i < 16; i++) PALETTE[i + 1] = S->pal[seg].col[i];
             }
             REG_DISPCNT = 4 | (1 << 10) | (page << 4);
             pending = 0;
         }
-        unsigned f = (t * fps_num) >> 16;
+        unsigned f = (t * FPS_NUM) >> 16;
         if (f >= count) f = count - 1;
         if ((int)(f >> 1) != (drawn < 0 ? -1 : (drawn >> 1))) {   /* same unique frame -> nothing to redraw */
-            while (pend_seg + 1 < nseg && palette_data[pend_seg + 1].first <= f) pend_seg++;
-            while (pend_seg > 0 && palette_data[pend_seg].first > f) pend_seg--;
-            decode_frame(frames_start, frames_idx_start[f >> 1], frames_idx_start[(f >> 1) + 1]);
+            while (pend_seg + 1 < S->npal && S->pal[pend_seg + 1].first <= f) pend_seg++;
+            while (pend_seg > 0 && S->pal[pend_seg].first > f) pend_seg--;
+            decode_frame(S->frames, S->idx[f >> 1], S->idx[(f >> 1) + 1]);
             draw_frame(frame_buf, page ? VRAM_PAGE0 : VRAM_PAGE1);
             drawn = (int)f;
             pending = 1;
         }
+    }
+
+    stop_audio();
+    REG_DISPCNT = 4 | (1 << 10);            /* back to page 0 */
+}
+
+int main(void) {
+    static const char *const main_items[3] = { "PLAY", "CHAPTERS", "CONTROLS" };
+    static const char *const chap_items[NCHAPTERS] = { "PART 1", "PART 2", "PART 3", "PART 4", "PART 5", "PART 6" };
+    init_streams();
+    for (;;) {
+        int a = menu(main_items, 3, 0);
+        if (a == -2) continue;                                  /* secret screen was shown */
+        if (a == -3) { play_stream(&extra, 0); continue; }      /* D D U U L R L R B A: hidden clip */
+        if (a == 0) play_stream(&film, 0);
+        else if (a == 1) { int c = menu(chap_items, NCHAPTERS, 1); if (c >= 0) play_stream(&film, chapter_tick(&film, c)); }
+        else controls();
     }
 }
