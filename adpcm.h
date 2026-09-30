@@ -34,4 +34,32 @@ static void adpcm_decode(const u8 *p, s8 *out, int nbytes, int *ppred, int *psid
     }
     *ppred = pred; *psidx = sidx;
 }
+/* ---- ADPCM2: 2-bit MONO ADPCM used by the hidden Konami clip (4 samples per byte, lowest bits first). ----
+   Code: bit1 = sign, bit0 = "big" (step*1.5) vs "small" (step*0.5).  Big codes grow the step index by
+   ADPCM2_GROW, small ones shrink it by 1.  Shares step_tab with the 4-bit codec; same leak, same 8-bit output. */
+#define ADPCM2_GROW 3
+static inline void adpcm2_step(int code, int *ppred, int *psidx) {
+    int step = step_tab[*psidx];
+    int diff = (step >> 1) + ((code & 1) ? step : 0);
+    int pred = *ppred;
+    if (code & 2) pred -= diff; else pred += diff;
+    pred -= pred >> 9;
+    if (pred > 32767) pred = 32767;
+    if (pred < -32768) pred = -32768;
+    int s = *psidx + ((code & 1) ? ADPCM2_GROW : -1);
+    if (s < 0) s = 0;
+    if (s > 88) s = 88;
+    *ppred = pred; *psidx = s;
+}
+static void adpcm2_decode(const u8 *p, s8 *out, int nbytes, int *ppred, int *psidx) {
+    int pred = *ppred, sidx = *psidx;
+    for (int i = 0; i < nbytes; i++) {
+        u8 b = p[i];
+        for (int k = 0; k < 4; k++) {
+            adpcm2_step((b >> (2 * k)) & 3, &pred, &sidx);
+            out[i * 4 + k] = (s8)(pred >> 8);
+        }
+    }
+    *ppred = pred; *psidx = sidx;
+}
 #endif

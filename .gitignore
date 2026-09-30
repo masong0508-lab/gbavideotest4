@@ -6,6 +6,7 @@ build/
 
 # encoder scratch / compiled helper tools
 work/
+clip/preview_audio.raw
 tools/adpcm_enc
 tools/recompress/lrle
 tools/recompress/dec

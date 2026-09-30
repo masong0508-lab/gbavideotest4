@@ -9,6 +9,7 @@ GBAFIX  := $(shell which gbafix 2>/dev/null || echo /opt/devkitpro/tools/bin/gba
 PARTDIR ?= parts
 PARTS   := $(sort $(notdir $(wildcard $(PARTDIR)/part[0-9]*)))
 ASSETS  := menu_bg.bin menu_bg6.bin menu_pal.bin secret_bg.bin secret_pal.bin extra_frames.bin extra_idx.bin extra_palette.bin extra_audio.bin extra_state.bin
+CLIPFILES := clip_frames.bin clip_idx.bin clip_palette.bin clip_audio.bin clip_state.bin   # present in part01 only: enables the Konami clip (-DHAVE_CLIP)
 NEEDED  := frames1a.bin frames1b.bin frames2.bin frames_idx.bin palette.bin audio_a.bin audio_b.bin audio_state.bin
 CFLAGS  := -O2 -mthumb -mthumb-interwork -Wall
 
@@ -27,10 +28,11 @@ all: $(ROMS)
 .SECONDEXPANSION:
 
 # .incbin in main.c finds the .bin pieces through -Wa,-I (the part directory); the menu + hidden-clip .bin files sit in the repo root, where the assembler looks by default
-build/%.elf: main.c adpcm.h $$(wildcard $(PARTDIR)/$$*/*.bin) $(ASSETS)
+build/%.elf: main.c adpcm.h rle.h $$(wildcard $(PARTDIR)/$$*/*.bin) $(ASSETS)
 	@for f in $(NEEDED); do test -f $(PARTDIR)/$*/$$f || { echo "ERROR: $(PARTDIR)/$*/$$f is missing"; exit 1; }; done
+	@if [ -f $(PARTDIR)/$*/clip_idx.bin ]; then for f in $(CLIPFILES); do test -f $(PARTDIR)/$*/$$f || { echo "ERROR: $(PARTDIR)/$*/$$f is missing (Konami clip incomplete)"; exit 1; }; done; fi
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Wa,-I$(PARTDIR)/$* -specs=gba.specs main.c -o $@
+	$(CC) $(CFLAGS) $(if $(wildcard $(PARTDIR)/$*/clip_idx.bin),-DHAVE_CLIP) -Wa,-I$(PARTDIR)/$* -specs=gba.specs main.c -o $@
 
 build/%.gba: build/%.elf
 	$(OBJCOPY) -O binary $< $@

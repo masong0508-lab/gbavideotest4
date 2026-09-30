@@ -5,6 +5,7 @@
    In video: START (or A+Up) = pause/resume, A+Right = fast-forward, A+Left (or A+Down) = rewind, SELECT = back to menu.
    All video/audio data lives in the .bin files; see README.md and tools/gbatool.py. */
 #include "adpcm.h"
+#include "rle.h"
 
 #define REG16(a) (*(volatile u16*)(a))
 #define REG32(a) (*(volatile u32*)(a))
@@ -110,6 +111,26 @@ __asm__(
     ".global x_state\nx_state:\n"
     ".incbin \"extra_state.bin\"\n"
     ".balign 4\n"
+#ifdef HAVE_CLIP   /* Konami clip: only ROM part 01 has clip_*.bin in its folder (Makefile sets -DHAVE_CLIP) */
+    ".global c_frames_start\nc_frames_start:\n"
+    ".incbin \"clip_frames.bin\"\n"
+    ".balign 4\n"
+    ".global c_idx_start\nc_idx_start:\n"
+    ".incbin \"clip_idx.bin\"\n"
+    ".global c_idx_end\nc_idx_end:\n"
+    ".balign 4\n"
+    ".global c_pal_start\nc_pal_start:\n"
+    ".incbin \"clip_palette.bin\"\n"
+    ".global c_pal_end\nc_pal_end:\n"
+    ".balign 4\n"
+    ".global c_audio_start\nc_audio_start:\n"
+    ".incbin \"clip_audio.bin\"\n"
+    ".global c_audio_end\nc_audio_end:\n"
+    ".balign 4\n"
+    ".global c_state\nc_state:\n"
+    ".incbin \"clip_state.bin\"\n"
+    ".balign 4\n"
+#endif
     ".text\n"
 );
 extern const u8  frames_start[], frames_end[];
@@ -126,6 +147,14 @@ extern const u32 x_idx_start[], x_idx_end[];
 extern const PalSeg x_pal_start[], x_pal_end[];
 extern const u8  x_audio_start[], x_audio_end[];
 extern const u32 x_state[];
+#ifdef HAVE_CLIP
+extern const u8  c_frames_start[];
+extern const u32 c_idx_start[], c_idx_end[];
+extern const PalSeg c_pal_start[], c_pal_end[];
+extern const u8  c_audio_start[], c_audio_end[];
+extern const u32 c_state[];
+#define CHUNK_BYTES_MONO 76                 /* ADPCM2: 304 samples x 2 bits */
+#endif
 
 /* One playable video: the film of this ROM part, or the hidden clip. */
 typedef struct {
@@ -134,8 +163,9 @@ typedef struct {
     const PalSeg *pal; u32 npal;
     const u8 *audio; u32 nchunks;
     const u32 *state;
+    int mono;                        /* 1 = ADPCM2 mono clip (FIFO A on both speakers), 0 = stereo 4-bit ADPCM */
 } Stream;
-static Stream film, extra;
+static Stream film, extra, konami;
 static void init_streams(void) {
     film.frames = frames_start;  film.idx = frames_idx_start;  film.nuniq = (u32)(frames_idx_end - frames_idx_start) - 1;
     film.pal = palette_data;     film.npal = (u32)(palette_end - palette_data);
@@ -145,6 +175,12 @@ static void init_streams(void) {
     extra.pal = x_pal_start;       extra.npal = (u32)(x_pal_end - x_pal_start);
     extra.audio = x_audio_start;   extra.nchunks = (u32)(x_audio_end - x_audio_start) / CHUNK_BYTES;
     extra.state = x_state;
+#ifdef HAVE_CLIP
+    konami.frames = c_frames_start; konami.idx = c_idx_start;  konami.nuniq = (u32)(c_idx_end - c_idx_start) - 1;
+    konami.pal = c_pal_start;       konami.npal = (u32)(c_pal_end - c_pal_start);
+    konami.audio = c_audio_start;   konami.nchunks = (u32)(c_audio_end - c_audio_start) / CHUNK_BYTES_MONO;
+    konami.state = c_state;         konami.mono = 1;
+#endif
 }
 
 /* ---- audio state ---- */
@@ -155,6 +191,8 @@ static volatile u32 started;       /* chunks started so far in this loop */
 static volatile u32 play_idx;      /* buffer to start at the next chunk boundary */
 static volatile u32 g_vb_per_chunk;
 static volatile u16 g_timer_reload;
+static volatile u32 g_mono;        /* 1: mono ADPCM2 stream, only DMA1 / FIFO A is used */
+static u32 g_chunk_bytes;          /* bytes per chunk in the stream being played */
 
 static const u8 *ap;               /* start of the next chunk in audio.bin */
 static int pred[2], sidx[2];
@@ -164,9 +202,13 @@ static u32 g_nchunks;
 
 static void decode_chunk(int buf) {
     if (dec == g_nchunks) { dec = 0; ap = g_audio_base; pred[0] = pred[1] = 0; sidx[0] = sidx[1] = 0; }
-    adpcm_decode(ap,                       abuf[buf][0], SAMPLES_PER_CHUNK / 2, &pred[0], &sidx[0]);
-    adpcm_decode(ap + SAMPLES_PER_CHUNK/2, abuf[buf][1], SAMPLES_PER_CHUNK / 2, &pred[1], &sidx[1]);
-    ap += CHUNK_BYTES;
+    if (g_mono) {
+        adpcm2_decode(ap, abuf[buf][0], SAMPLES_PER_CHUNK / 4, &pred[0], &sidx[0]);
+    } else {
+        adpcm_decode(ap,                       abuf[buf][0], SAMPLES_PER_CHUNK / 2, &pred[0], &sidx[0]);
+        adpcm_decode(ap + SAMPLES_PER_CHUNK/2, abuf[buf][1], SAMPLES_PER_CHUNK / 2, &pred[1], &sidx[1]);
+    }
+    ap += g_chunk_bytes;
     dec++;
 }
 
@@ -186,9 +228,11 @@ static void irq_handler(void) {
             REG_DMA1SAD = (u32)abuf[play_idx][0];
             REG_DMA1DAD = 0x040000A0;         /* FIFO A = left */
             REG_DMA1CNT = 0xB6400001;         /* fifo mode, 32-bit, repeat, enable */
-            REG_DMA2SAD = (u32)abuf[play_idx][1];
-            REG_DMA2DAD = 0x040000A4;         /* FIFO B = right */
-            REG_DMA2CNT = 0xB6400001;
+            if (!g_mono) {
+                REG_DMA2SAD = (u32)abuf[play_idx][1];
+                REG_DMA2DAD = 0x040000A4;     /* FIFO B = right */
+                REG_DMA2CNT = 0xB6400001;
+            }
             REG_TM0CNT_L = g_timer_reload;
             REG_TM0CNT_H = 0x80;
             play_idx ^= 1;
@@ -205,12 +249,7 @@ static void irq_handler(void) {
 static u8 frame_buf[FRAME_BYTES];
 
 static void decode_frame(const u8 *comp, u32 off, u32 end) {
-    const u8 *p = comp + off, *stop = comp + end;
-    u8 *out = frame_buf, *out_end = frame_buf + FRAME_BYTES;
-    while (p < stop && out < out_end) {
-        u8 run = *p++, val = *p++;
-        for (u8 i = 0; i < run && out < out_end; i++) *out++ = val;
-    }
+    rle_decode_frame(comp, off, end, frame_buf, FRAME_BYTES, VID_W);     /* rle.h: also understands the clip's row-repeat */
 }
 
 /* Draw a 120x68 frame doubled to 240x136 into Mode 4 VRAM, centred. */
@@ -354,7 +393,11 @@ static int menu(const char *const *items, int n, int allow_back) {
         if (!allow_back && hit) {                            /* Konami: U U D D L R L R B A */
             if (hit == konami[ki]) ki++;
             else ki = (hit == konami[0]) ? 1 : 0;
+#ifdef HAVE_CLIP
+            if (ki == 10) return -4;                         /* ROM 1: Konami code plays the squashed clip */
+#else
             if (ki == 10) { secret(); return -2; }
+#endif
 
             if (hit == konami2[ki2]) ki2++;
             else ki2 = (hit == konami2[0]) ? 1 : 0;
@@ -367,21 +410,42 @@ static int menu(const char *const *items, int n, int allow_back) {
     }
 }
 
+#ifdef HAVE_CLIP
+/* Quick fade of the menu to black, then a short black beat before the clip starts. */
+static void blackout(void) {
+    for (int s = 1; s <= 8; s++) {
+        wait_vb();
+        for (int i = 0; i < 256; i++) {
+            u16 c = menu_pal[i];
+            int r = (c & 31) * (8 - s) / 8, g = ((c >> 5) & 31) * (8 - s) / 8, b = ((c >> 10) & 31) * (8 - s) / 8;
+            PALETTE[i] = (u16)(r | (g << 5) | (b << 10));
+        }
+    }
+    REG_BLDCNT = 0;
+    for (int i = 0; i < 128; i++) OAM[i * 4] = 0x200;        /* hide the selection glow */
+    for (int i = 0; i < 256; i++) PALETTE[i] = 0;
+    for (int n = 0; n < 12; n++) wait_vb();
+}
+#endif
+
 /* ================= playback ================= */
-static void start_audio(u32 st, const u8 *audio_base, u32 nchunks, const u32 *states) {
+static void start_audio(u32 st, const u8 *audio_base, u32 nchunks, const u32 *states, int mono) {
     REG_IME = 0;
     REG_SOUNDCNT_X = 0x80;
     /* DMA A+B 100% vol, A -> left only, B -> right only, both on timer 0, reset both FIFOs */
-    REG_SOUNDCNT_H = 0x9A0C;
+    /* mono clip: FIFO A to BOTH speakers (bits 8+9), FIFO B unused; both FIFOs still reset */
+    REG_SOUNDCNT_H = mono ? 0x8B04 : 0x9A0C;
+    g_mono = (u32)mono;
+    g_chunk_bytes = mono ? 76 : CHUNK_BYTES;
     g_audio_base = audio_base;
     g_nchunks = nchunks;
     g_vb_per_chunk = VB_PER_CHUNK;
     g_timer_reload = (u16)(65536 - TIMER_PERIOD);
     u32 c = st / g_vb_per_chunk;
-    dec = c; ap = audio_base + c * CHUNK_BYTES;
+    dec = c; ap = audio_base + c * g_chunk_bytes;
     /* ADPCM only decodes correctly from the exact state it had at that point in the stream. */
-    for (int ch = 0; ch < 2; ch++) {
-        u32 sv = states[c * 2 + ch]; pred[ch] = (short)(sv & 0xFFFF); sidx[ch] = (int)((sv >> 16) & 0xFF);
+    for (int ch = 0; ch < (mono ? 1 : 2); ch++) {         /* mono clip: one state per chunk, stereo: [L,R] */
+        u32 sv = states[mono ? c : c * 2 + ch]; pred[ch] = (short)(sv & 0xFFFF); sidx[ch] = (int)((sv >> 16) & 0xFF);
     }
     play_idx = 0; started = c; tick = st; achunk_ctr = g_vb_per_chunk - 1;
     decode_chunk(0);
@@ -463,7 +527,7 @@ static void play_stream(const Stream *S, u32 st) {
     for (int i = 0; i < 16; i++) PALETTE[i + 1] = S->pal[seg].col[i];
     u32 pend_seg = seg;
 
-    start_audio(st, S->audio, S->nchunks, S->state);
+    start_audio(st, S->audio, S->nchunks, S->state, S->mono);
 
     u32 last = st, pos = st;
     int mode = 0;                           /* 0 play, 1 pause, 2 fast-forward, 3 rewind */
@@ -501,7 +565,7 @@ static void play_stream(const Stream *S, u32 st) {
             if (mode == 0) { pos = t > maxpos ? maxpos : t; stop_audio(); }
             if (nm == 0) {                  /* resume: re-sync audio to the video position */
                 u32 s = pos & ~(u32)(VB_PER_CHUNK - 1);
-                start_audio(s, S->audio, S->nchunks, S->state);
+                start_audio(s, S->audio, S->nchunks, S->state, S->mono);
                 last = s; t = s;
             }
             mode = nm;
@@ -539,7 +603,10 @@ int main(void) {
     for (;;) {
         int a = menu(main_items, 3, 0);
         if (a == -2) continue;                                  /* secret screen was shown */
-        if (a == -3) { play_stream(&extra, 0); continue; }      /* D D U U L R L R B A: hidden clip */
+        if (a == -3) { play_stream(&extra, 0); continue; }
+#ifdef HAVE_CLIP
+        if (a == -4) { blackout(); play_stream(&konami, 0); continue; }   /* U U D D L R L R B A */
+#endif      /* D D U U L R L R B A: hidden clip */
         if (a == 0) play_stream(&film, 0);
         else if (a == 1) { int c = menu(chap_items, NCHAPTERS, 1); if (c >= 0) play_stream(&film, chapter_tick(&film, c)); }
         else controls();
