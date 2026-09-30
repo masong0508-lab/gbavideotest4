@@ -8,7 +8,7 @@ jobs:
       - name: Check the uploaded asset pieces are all there and intact
         run: sh tools/verify_assets.sh parts/film
       - name: Cut the film into ROM-sized parts
-        run: python3 tools/split_parts.py parts/film gen
+        run: python3 tools/split_parts.py parts/film gen --clip clip
       - uses: actions/upload-artifact@v4
         with:
           name: film-parts
