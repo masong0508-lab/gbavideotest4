@@ -10,7 +10,7 @@ frames=[]
 for m in man:
     d=P+f'part{m["part"]:02d}/'
     idx=np.frombuffer(open(d+'frames_idx.bin','rb').read(),'<u4')
-    data=open(d+'frames1.bin','rb').read()+open(d+'frames2.bin','rb').read()
+    data=b''.join(open(d+n,'rb').read() for n in ('frames1a.bin','frames1b.bin','frames2.bin')) if os.path.exists(d+'frames1a.bin') else open(d+'frames1.bin','rb').read()+open(d+'frames2.bin','rb').read()
     pal=np.frombuffer(open(d+'palette.bin','rb').read(),'<u2').astype(np.int32)
     rgb=np.stack([((pal&31)<<3)|((pal&31)>>2),(((pal>>5)&31)<<3)|(((pal>>5)&31)>>2),(((pal>>10)&31)<<3)|(((pal>>10)&31)>>2)],1).astype(np.uint8)
     for k in range(m['frames']):
@@ -53,7 +53,8 @@ uoffs=np.concatenate([[0],np.cumsum(sz)]).astype(np.uint32)   # per unique frame
 NF_U=len(frames)
 os.makedirs('out',exist_ok=True)
 SPLIT=24*1024*1024
-open('out/frames1.bin','wb').write(data[:SPLIT]); open('out/frames2.bin','wb').write(data[SPLIT:])
+f1=data[:SPLIT]; h=len(f1)//2
+open('out/frames1a.bin','wb').write(f1[:h]); open('out/frames1b.bin','wb').write(f1[h:]); open('out/frames2.bin','wb').write(data[SPLIT:])
 open('out/frames_idx.bin','wb').write(uoffs.tobytes())   # per UNIQUE frame (each shown for 2 x 5fps ticks)
 seg_frames=[s*2 for s in segs[:-1]]
 open('out/palette.bin','wb').write(b''.join(struct.pack('<I',sf)+struct.pack('<16H',*p) for sf,p in zip(seg_frames,pals)))
