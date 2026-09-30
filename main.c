@@ -80,6 +80,9 @@ __asm__(
     ".global menu_bg\nmenu_bg:\n"
     ".incbin \"menu_bg.bin\"\n"
     ".balign 4\n"
+    ".global menu_bg6\nmenu_bg6:\n"
+    ".incbin \"menu_bg6.bin\"\n"
+    ".balign 4\n"
     ".global menu_pal\nmenu_pal:\n"
     ".incbin \"menu_pal.bin\"\n"
     ".balign 4\n"
@@ -117,7 +120,7 @@ typedef struct { u32 first; u16 col[16]; } PalSeg;
 extern const PalSeg palette_data[], palette_end[];
 extern const u8  audio_start[], audio_end[];
 extern const u32 audio_state[];   /* per chunk, [L,R]: low 16 bits = predictor (s16), bits 16-23 = step index */
-extern const u16 menu_bg[19200], menu_pal[256], secret_bg[19200], secret_pal[256];
+extern const u16 menu_bg[19200], menu_bg6[19200], menu_pal[256], secret_bg[19200], secret_pal[256];
 extern const u8  x_frames_start[];
 extern const u32 x_idx_start[], x_idx_end[];
 extern const PalSeg x_pal_start[], x_pal_end[];
@@ -273,11 +276,11 @@ static void text(int x, int y, const char *s) {
     }
 }
 
-static void menu_setup(void) {
+static void menu_setup(const u16 *bg) {
     REG_IME = 0;
     for (int i = 0; i < 256; i++) PALETTE[i] = menu_pal[i];
     REG_DISPCNT = 4 | (1 << 10);
-    for (int i = 0; i < 19200; i++) VRAM_PAGE0[i] = menu_bg[i];
+    for (int i = 0; i < 19200; i++) VRAM_PAGE0[i] = bg[i];
     for (int i = 0; i < 128; i++) OAM[i * 4] = 0x200;      /* hide all sprites */
 }
 
@@ -330,7 +333,7 @@ static void secret(void) {
 
 /* returns chosen index, or -1 for B (only when allow_back) */
 static int menu(const char *const *items, int n, int allow_back) {
-    menu_setup();
+    menu_setup(n > 3 ? menu_bg6 : menu_bg);     /* 3 pills for the main menu, 6 for the chapter list */
     for (int i = 0; i < n; i++) text(COL_CX - text_w(items[i]) / 2, ROW_Y(i) - 3, items[i]);
     make_highlight();
     REG_DISPCNT = 4 | (1 << 10) | (1 << 6) | (1 << 12);
@@ -403,7 +406,7 @@ static void stop_audio(void) {
 
 /* ---- CONTROLS screen ---- */
 static void controls(void) {
-    menu_setup();
+    menu_setup(menu_bg);
     for (int y = 10; y < 150; y++) for (int x = 10; x < 230; x++) put(x, y, 254);
     text(20, 16, "CONTROLS");
     text(20, 34, "UP DOWN   MOVE");
