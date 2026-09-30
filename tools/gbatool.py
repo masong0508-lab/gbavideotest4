@@ -9,9 +9,9 @@ video greedily into parts that each fill (just under) 32 MiB, giving every part 
 
 Formats (must match main.c):
   frames_idx.bin : u32 byte offset per frame into the RLE stream (+1 final entry = total)
-  frames1/2.bin  : RLE stream (run,value byte pairs, run 1-255), split at 24 MiB (GitHub file limit)
+  frames1a/1b/2.bin : RLE stream (run,value byte pairs, run 1-255), cut at 24 MiB, first 24 MiB halved (GitHub file limit)
   palette.bin    : 256 x u16 BGR555
-  audio.bin      : per 304-sample chunk (2 vblanks): 152 bytes left ADPCM then 152 bytes right ADPCM
+  audio_a/b.bin  : per 304-sample chunk (2 vblanks): 152 bytes left ADPCM then 152 bytes right ADPCM, cut in two at a chunk boundary
   audio_state.bin: per chunk, u32 [left, right] = predictor(s16) | stepindex<<16 at chunk start (for seeking)
 """
 import argparse, json, math, os, struct, subprocess, sys, tempfile
@@ -145,9 +145,12 @@ def cmd_film(a):
         d = os.path.join(a.out, f'part{pno:02d}'); os.makedirs(d, exist_ok=True)
         data = b''.join(rle_parts)
         audio, states, _ = audio_for_part(pcm, first, n, tmp)
-        wr(d, 'frames1.bin', data[:SPLIT]); wr(d, 'frames2.bin', data[SPLIT:])
+        f1 = data[:SPLIT]; h = len(f1) // 2
+        wr(d, 'frames1a.bin', f1[:h]); wr(d, 'frames1b.bin', f1[h:]); wr(d, 'frames2.bin', data[SPLIT:])
         wr(d, 'frames_idx.bin', struct.pack(f'<{len(offs)}I', *offs))
-        wr(d, 'palette.bin', pal_bytes); wr(d, 'audio.bin', audio); wr(d, 'audio_state.bin', states)
+        wr(d, 'palette.bin', pal_bytes); wr(d, 'audio_state.bin', states)
+        ac = (len(audio) // (2 * CHUNK_BYTES)) // 2 * (2 * CHUNK_BYTES)      # halve on a chunk boundary
+        wr(d, 'audio_a.bin', audio[:ac]); wr(d, 'audio_b.bin', audio[ac:])
         size = sum(os.path.getsize(os.path.join(d, x)) for x in os.listdir(d))
         # round-trip check of a few frames
         for k in (0, n // 2, n - 1):
