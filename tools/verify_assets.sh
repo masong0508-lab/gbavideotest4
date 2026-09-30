@@ -1,12 +1,19 @@
 #!/bin/sh
-# Verifies that the split asset pieces in parts/<name>/ still join back into the original streams
-# (run this after cloning / uploading to GitHub). Uses parts/<name>/SHA256SUMS written when the files were split.
-# usage: tools/verify_assets.sh [parts/film]
+# Checks that every asset piece in parts/<name>/ is present and joins back into the original stream
+# (run after uploading to GitHub). Checksums are in parts/<name>/SHA256SUMS, one line per check, in this order.
+# usage: sh tools/verify_assets.sh [parts/film]
 d="${1:-parts/film}"
-want() { sed -n "$1p" "$d/SHA256SUMS" | cut -d' ' -f1; }
-ok=0
-chk() { got=$(cat "$@" | sha256sum | cut -d' ' -f1); [ "$got" = "$(want $n)" ] && echo "OK   $*" || { echo "FAIL $*"; ok=1; }; }
-n=1; chk "$d/frames1a.bin" "$d/frames1b.bin"
-n=2; chk "$d/audio_a.bin" "$d/audio_b.bin"
-n=3; chk "$d/frames2.bin"
-exit $ok
+bad=0
+check() {  # check <line-in-SHA256SUMS> <file>...
+    want=$(sed -n "$1p" "$d/SHA256SUMS" | cut -d' ' -f1); shift
+    for f in "$@"; do [ -f "$d/$f" ] || { echo "MISSING $d/$f"; bad=1; return; }; done
+    got=$(for f in "$@"; do cat "$d/$f"; done | sha256sum | cut -d' ' -f1)
+    if [ "$got" = "$want" ]; then echo "OK      $*"; else echo "CORRUPT $*"; bad=1; fi
+}
+check 1 frames1a.bin frames1b.bin
+check 2 audio_a.bin audio_b.bin
+check 3 frames2.bin
+check 4 frames_idx.bin
+check 5 palette.bin
+check 6 audio_state.bin
+exit $bad
