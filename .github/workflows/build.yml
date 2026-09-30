@@ -1,12 +1,29 @@
 name: Build GBA ROMs
 on: [push, workflow_dispatch]
 jobs:
+  split:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the uploaded asset pieces are all there and intact
+        run: sh tools/verify_assets.sh parts/film
+      - name: Cut the film into ROM-sized parts
+        run: python3 tools/split_parts.py parts/film gen
+      - uses: actions/upload-artifact@v4
+        with:
+          name: film-parts
+          path: gen
   build:
+    needs: split
     runs-on: ubuntu-latest
     container: devkitpro/devkitarm
     steps:
       - uses: actions/checkout@v4
-      - run: make
+      - uses: actions/download-artifact@v4
+        with:
+          name: film-parts
+          path: gen
+      - run: make PARTDIR=gen
       - run: ls -la build && for f in build/*.gba; do test $(stat -c %s $f) -le 33554432 || { echo "$f exceeds 32 MiB"; exit 1; }; done
       - uses: actions/upload-artifact@v4
         with:
